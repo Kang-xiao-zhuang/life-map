@@ -1,0 +1,17 @@
+# deps
+node_modules/
+
+# build output
+dist/
+dist-ssr/
+
+# vite
+.vite/
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+*.local
+*.log
+npm-debug.log*
