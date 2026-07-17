@@ -57,6 +57,42 @@
         </div>
       </aside>
 
+      <!-- 悬浮功能按钮 -->
+      <div class="fabs">
+        <button class="fab" :class="{ 'fab--on': provincesOn }" title="点亮省份" @click="toggleProvinces">🗺️</button>
+        <button class="fab" title="数据看板" @click="statsOpen = true">📊</button>
+        <button class="fab fab--play" title="旅程回放" @click="playJourney">▶</button>
+      </div>
+
+      <!-- 旅程回放浮层 -->
+      <div v-if="playing" class="playback">
+        <img v-if="playCurrent" :src="playCurrent.url" class="playback__img" />
+        <div class="playback__info">
+          <div class="playback__date">
+            <span v-if="playCurrent && playCurrent.city">{{ playCurrent.city }} · </span>{{ playCurrent ? fmt(playCurrent.takenAt) : '' }}<span v-if="playCurrent && playCurrent.count > 1"> · {{ playCurrent.count }} 张</span>
+          </div>
+          <div class="playback__prog">第 {{ playProgress.i }} / {{ playProgress.total }} 站</div>
+        </div>
+        <button class="playback__stop" @click="stopJourney">⏹ 停止</button>
+      </div>
+
+      <!-- 数据看板 -->
+      <div v-if="statsOpen" class="modal" @click.self="statsOpen = false">
+        <div class="dash">
+          <button class="drawer__close" @click="statsOpen = false">✕</button>
+          <div class="dash__title">📊 我的足迹数据</div>
+          <div class="dash__km">{{ totalKm.toLocaleString() }}<span> km</span></div>
+          <div class="dash__kmlabel">按时间顺序走过的总里程</div>
+          <div class="dash__grid">
+            <div class="dash__cell"><b>{{ cityCount }}</b><span>城市</span></div>
+            <div class="dash__cell"><b>{{ placed.length }}</b><span>足迹</span></div>
+            <div class="dash__cell"><b>{{ placed.length + pending.length }}</b><span>照片</span></div>
+          </div>
+          <div class="dash__row"><span>最常去</span><b>{{ topCity }}</b></div>
+          <div class="dash__row"><span>时间跨度</span><b>{{ dateRange }}</b></div>
+        </div>
+      </div>
+
       <!-- 待定位照片条 -->
       <footer v-if="pending.length" class="tray">
         <span class="tray__hint">待定位（点缩略图 → 再点地图放置）</span>
@@ -75,8 +111,10 @@
 import { onMounted, onBeforeUnmount, ref, computed, watch } from 'vue';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import 'leaflet.markercluster';
+import 'leaflet.markercluster/dist/MarkerCluster.css';
+import 'leaflet.markercluster/dist/MarkerCluster.Default.css';
 import exifr from 'exifr';
-import heic2any from 'heic2any';
 import { db } from './db.js';
 import { reverseCity } from './geocode.js';
 import { drawPoster } from './poster.js';
@@ -113,6 +151,34 @@ const trips = computed(() => {
 });
 watch(selectedYear, () => renderMarkers());
 
+// 杀手功能：旅程回放 / 数据看板 / 点亮省份
+const playing = ref(false);
+const playCurrent = ref(null);
+const playProgress = ref({ i: 0, total: 0 });
+const statsOpen = ref(false);
+const provincesOn = ref(false);
+const totalKm = computed(() => {
+  const list = [...placed.value].sort((a, b) => ts(a.takenAt) - ts(b.takenAt));
+  let d = 0;
+  for (let i = 1; i < list.length; i++) d += haversine(list[i - 1], list[i]);
+  return Math.round(d);
+});
+const topCity = computed(() => {
+  const m = {};
+  for (const p of placed.value) if (p.city) m[p.city] = (m[p.city] || 0) + 1;
+  const e = Object.entries(m).sort((a, b) => b[1] - a[1])[0];
+  return e ? `${e[0]}（${e[1]} 次）` : '—';
+});
+const dateRange = computed(() => {
+  if (!placed.value.length) return '—';
+  const ds = placed.value.map((p) => ts(p.takenAt)).sort((a, b) => a - b);
+  return `${fmt(new Date(ds[0]))} ~ ${fmt(new Date(ds[ds.length - 1]))}`;
+});
+let playLine = null;
+let playAbort = false;
+let provinceLayer = null;
+let provincesGeo = null;
+
 let map;
 let markersLayer;
 const markers = new Map(); // id → L.marker
@@ -127,9 +193,31 @@ onMounted(async () => {
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     { maxZoom: 19, attribution: '&copy; Esri' },
   );
-  esriStreet.addTo(map);
-  L.control.layers({ '街道图': esriStreet, '卫星图': esriImagery }, {}, { collapsed: false }).addTo(map);
-  markersLayer = L.layerGroup().addTo(map);
+  // 精致深色底图（灰底 + 单独的标注层），照片钉子在深色上更亮眼
+  const dark = L.layerGroup([
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16, attribution: '&copy; Esri' }),
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16, attribution: '&copy; Esri' }),
+  ]);
+  dark.addTo(map); // 默认深色
+  L.control.layers({ '深色': dark, '街道': esriStreet, '卫星': esriImagery }, {}, { collapsed: false }).addTo(map);
+  // 地点聚合：markercluster 自动按缩放把邻近足迹聚成数字气泡，放大自动散开，同点可展开
+  markersLayer = L.markerClusterGroup({
+    showCoverageOnHover: false,
+    maxClusterRadius: 55,
+    spiderfyOnMaxZoom: true,
+    // 聚合气泡用簇内一张照片当封面 + 角标数字，整张图像照片墙
+    iconCreateFunction: (cluster) => {
+      const first = cluster.getAllChildMarkers()[0];
+      const url = first?.options?.photoUrl || '';
+      const count = cluster.getChildCount();
+      return L.divIcon({
+        className: 'cluster-pin',
+        html: `<div class="cluster-pin__wrap"><img src="${url}" alt="" /><span class="cluster-pin__badge">${count}</span></div>`,
+        iconSize: [56, 56],
+        iconAnchor: [28, 28],
+      });
+    },
+  }).addTo(map);
   map.on('click', onMapClick);
   setTimeout(() => map.invalidateSize(), 200);
 
@@ -218,6 +306,7 @@ async function toDisplayable(file) {
   const isHeic = /image\/hei[cf]/i.test(file.type) || /\.(heic|heif)$/i.test(file.name);
   if (!isHeic) return file;
   try {
+    const { default: heic2any } = await import('heic2any'); // 懒加载：仅在遇到 HEIC 时才拉这个大包
     const out = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.85 });
     return Array.isArray(out) ? out[0] : out;
   } catch (_) {
@@ -344,9 +433,9 @@ async function onImport(e) {
 
 // ---- 地图/工具 ----
 function addMarker(p) {
-  const m = L.marker([p.lat, p.lng], { icon: photoIcon(p.url) });
+  const m = L.marker([p.lat, p.lng], { icon: photoIcon(p.url), photoUrl: p.url });
   m.on('click', () => openDetail(p));
-  m.addTo(markersLayer);
+  markersLayer.addLayer(m);
   markers.set(p.id, m);
 }
 
@@ -357,7 +446,7 @@ function photoIcon(url) {
 function fitToPhotos() {
   const list = visiblePlaced.value;
   if (list.length) {
-    map.fitBounds(L.latLngBounds(list.map((p) => [p.lat, p.lng])), { maxZoom: 12, padding: [60, 60] });
+    map.flyToBounds(L.latLngBounds(list.map((p) => [p.lat, p.lng])), { maxZoom: 12, padding: [60, 60], duration: 0.8 });
   }
 }
 
@@ -376,7 +465,7 @@ function selectYear(y) { selectedYear.value = y; }
 
 function zoomTo(photos) {
   if (!photos.length) return;
-  map.fitBounds(L.latLngBounds(photos.map((p) => [p.lat, p.lng])), { maxZoom: 13, padding: [60, 60] });
+  map.flyToBounds(L.latLngBounds(photos.map((p) => [p.lat, p.lng])), { maxZoom: 13, padding: [60, 60], duration: 0.8 });
   reviewOpen.value = false;
 }
 
@@ -400,6 +489,120 @@ async function onPoster() {
   } catch (e) {
     alert('生成海报失败：' + (e?.message || e));
   }
+}
+
+// ---- 5. 旅程回放：按时间顺序画飞线 + 镜头依次飞过 ----
+async function playJourney() {
+  const list = [...placed.value].sort((a, b) => ts(a.takenAt) - ts(b.takenAt));
+  const stops = buildStops(list); // 同一地区连续的多张合成一“站”，只在站间连线飞行
+  if (stops.length < 2) { alert('至少要有 2 个不同地区的足迹才能回放旅程'); return; }
+  reviewOpen.value = false;
+  selected.value = null;
+  playAbort = false;
+  playing.value = true;
+  if (playLine) map.removeLayer(playLine);
+  playLine = L.polyline([], { color: '#a855f7', weight: 3, opacity: 0.9 }).addTo(map);
+  const coords = [];
+  for (let i = 0; i < stops.length; i++) {
+    if (playAbort) break;
+    const s = stops[i];
+    playCurrent.value = { url: s.photos[0].url, takenAt: s.photos[0].takenAt, city: s.region, count: s.photos.length };
+    playProgress.value = { i: i + 1, total: stops.length };
+    coords.push([s.lat, s.lng]);
+    playLine.setLatLngs(coords);
+    map.flyTo([s.lat, s.lng], Math.max(map.getZoom(), 6), { duration: 1.1 });
+    await sleep(1600);
+  }
+  playing.value = false;
+  playCurrent.value = null;
+}
+
+// 把按时间排序的足迹，按“地区”（优先城市，否则 ~11km 网格）把连续同区合并为一“站”
+function buildStops(list) {
+  const stops = [];
+  let cur = null;
+  for (const p of list) {
+    const key = p.city || `${p.lat.toFixed(1)},${p.lng.toFixed(1)}`;
+    if (!cur || cur.key !== key) {
+      cur = { key, region: p.city || '', photos: [p] };
+      stops.push(cur);
+    } else {
+      cur.photos.push(p);
+    }
+  }
+  for (const s of stops) {
+    s.lat = s.photos.reduce((a, p) => a + p.lat, 0) / s.photos.length;
+    s.lng = s.photos.reduce((a, p) => a + p.lng, 0) / s.photos.length;
+  }
+  return stops;
+}
+function stopJourney() {
+  playAbort = true;
+  playing.value = false;
+  playCurrent.value = null;
+  if (playLine) { map.removeLayer(playLine); playLine = null; }
+}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// ---- 6. 里程：按时间顺序相邻足迹的大圆距离求和 ----
+function haversine(a, b) {
+  const R = 6371;
+  const toRad = (x) => (x * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// ---- 7. 点亮去过的省份 ----
+async function toggleProvinces() {
+  if (provinceLayer) {
+    map.removeLayer(provinceLayer);
+    provinceLayer = null;
+    provincesOn.value = false;
+    return;
+  }
+  provincesOn.value = true;
+  try {
+    if (!provincesGeo) {
+      const res = await fetch('https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json');
+      provincesGeo = await res.json();
+    }
+    const visited = new Set();
+    for (const f of provincesGeo.features) {
+      for (const p of placed.value) {
+        if (pointInFeature(p.lng, p.lat, f)) { visited.add(f.properties.adcode); break; }
+      }
+    }
+    provinceLayer = L.geoJSON(provincesGeo, {
+      style: (f) =>
+        visited.has(f.properties.adcode)
+          ? { color: '#a855f7', weight: 1, fillColor: '#a855f7', fillOpacity: 0.35 }
+          : { color: '#999', weight: 0.5, fillColor: '#000', fillOpacity: 0.04 },
+    }).addTo(map);
+  } catch (e) {
+    provincesOn.value = false;
+    alert('加载省界失败：' + (e?.message || e));
+  }
+}
+
+function pointInFeature(lng, lat, feature) {
+  const g = feature.geometry;
+  if (!g) return false;
+  const polys = g.type === 'Polygon' ? [g.coordinates] : g.type === 'MultiPolygon' ? g.coordinates : [];
+  for (const poly of polys) {
+    if (pointInRing(lng, lat, poly[0])) return true;
+  }
+  return false;
+}
+function pointInRing(x, y, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    const hit = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
+    if (hit) inside = !inside;
+  }
+  return inside;
 }
 
 async function makeThumb(file, maxSize = 1200, quality = 0.82) {
@@ -468,14 +671,14 @@ html, body, #app { height: 100%; margin: 0; }
 .banner { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 1200; background: rgba(17, 17, 17, 0.85); color: #fff; padding: 8px 14px; border-radius: 999px; font-size: 14px; display: flex; align-items: center; gap: 10px; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3); }
 .banner__cancel { border: none; background: rgba(255, 255, 255, 0.25); color: #fff; border-radius: 999px; padding: 3px 10px; cursor: pointer; }
 
-.drawer { position: absolute; top: 0; right: 0; bottom: 0; width: 340px; max-width: 82vw; z-index: 1200; background: #fff; box-shadow: -2px 0 16px rgba(0, 0, 0, 0.18); padding: 16px; overflow-y: auto; }
+.drawer { position: absolute; top: 0; right: 0; bottom: 0; width: 340px; max-width: 82vw; z-index: 1200; background: rgba(255, 255, 255, 0.72); backdrop-filter: blur(16px) saturate(1.3); -webkit-backdrop-filter: blur(16px) saturate(1.3); box-shadow: -2px 0 24px rgba(0, 0, 0, 0.22); padding: 16px; overflow-y: auto; }
 .drawer__close { position: absolute; top: 10px; right: 10px; border: none; background: #f1f1f4; width: 30px; height: 30px; border-radius: 50%; cursor: pointer; font-size: 14px; }
 .drawer__img { width: 100%; border-radius: 10px; display: block; margin-top: 24px; }
 .drawer__date { color: #666; font-size: 13px; margin: 10px 0; }
 .drawer__note { width: 100%; min-height: 100px; border: 1px solid #e2e2e8; border-radius: 10px; padding: 10px; font-size: 14px; resize: vertical; font-family: inherit; }
 .drawer__actions { display: flex; gap: 10px; margin-top: 12px; }
 
-.review { position: absolute; top: 0; left: 0; bottom: 0; width: 300px; max-width: 82vw; z-index: 1200; background: #fff; box-shadow: 2px 0 16px rgba(0, 0, 0, 0.18); padding: 14px; overflow-y: auto; }
+.review { position: absolute; top: 0; left: 0; bottom: 0; width: 300px; max-width: 82vw; z-index: 1200; background: rgba(255, 255, 255, 0.72); backdrop-filter: blur(16px) saturate(1.3); -webkit-backdrop-filter: blur(16px) saturate(1.3); box-shadow: 2px 0 24px rgba(0, 0, 0, 0.22); padding: 14px; overflow-y: auto; }
 .review__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .review__title { font-weight: 700; font-size: 16px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
@@ -488,7 +691,7 @@ html, body, #app { height: 100%; margin: 0; }
 .trip__range { font-weight: 600; font-size: 14px; color: #333; }
 .trip__meta { font-size: 12px; color: #777; margin-top: 4px; }
 
-.tray { position: absolute; left: 0; right: 0; bottom: 0; z-index: 1100; background: rgba(255, 255, 255, 0.96); border-top: 1px solid #e6e6ea; padding: 8px 12px; }
+.tray { position: absolute; left: 0; right: 0; bottom: 0; z-index: 1100; background: rgba(255, 255, 255, 0.7); backdrop-filter: blur(14px) saturate(1.3); -webkit-backdrop-filter: blur(14px) saturate(1.3); border-top: 1px solid rgba(255, 255, 255, 0.5); padding: 8px 12px; }
 .tray__hint { font-size: 12px; color: #888; }
 .tray__list { display: flex; gap: 8px; overflow-x: auto; padding-top: 6px; }
 .tray__item { position: relative; flex-shrink: 0; }
@@ -496,5 +699,44 @@ html, body, #app { height: 100%; margin: 0; }
 .tray__item--active img { border-color: #6366f1; }
 .tray__del { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; border: none; background: #ef4444; color: #fff; font-size: 12px; line-height: 1; cursor: pointer; }
 
-.photo-pin img { width: 48px; height: 48px; object-fit: cover; border-radius: 8px; border: 2px solid #fff; box-shadow: 0 1px 6px rgba(0, 0, 0, 0.45); }
+.photo-pin img { width: 48px; height: 48px; object-fit: cover; border-radius: 8px; border: 2px solid #fff; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5); transition: transform 0.15s ease; animation: pin-drop 0.35s ease both; }
+.photo-pin img:hover { transform: scale(1.18); }
+.leaflet-marker-icon:hover { z-index: 1000 !important; }
+
+/* 聚合气泡：照片封面 + 数字角标 */
+.cluster-pin__wrap { position: relative; width: 56px; height: 56px; }
+.cluster-pin__wrap img { width: 56px; height: 56px; object-fit: cover; border-radius: 12px; border: 2px solid #fff; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.55); }
+.cluster-pin__badge { position: absolute; top: -6px; right: -6px; min-width: 22px; height: 22px; padding: 0 6px; border-radius: 999px; background: #6366f1; color: #fff; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 5px rgba(0, 0, 0, 0.4); }
+
+@keyframes pin-drop { from { transform: translateY(-12px) scale(0.6); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* 悬浮功能按钮 */
+.fabs { position: absolute; right: 16px; bottom: 34px; z-index: 1100; display: flex; flex-direction: column; gap: 10px; }
+.fab { width: 46px; height: 46px; border-radius: 50%; border: none; cursor: pointer; font-size: 18px; background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(10px); box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3); display: flex; align-items: center; justify-content: center; transition: transform 0.12s; }
+.fab:hover { transform: scale(1.08); }
+.fab--on { background: #a855f7; }
+.fab--play { background: linear-gradient(135deg, #6366f1, #a855f7); color: #fff; }
+
+/* 旅程回放浮层 */
+.playback { position: absolute; left: 50%; bottom: 30px; transform: translateX(-50%); z-index: 1300; display: flex; align-items: center; gap: 12px; background: rgba(20, 20, 24, 0.82); backdrop-filter: blur(14px); color: #fff; padding: 10px 14px; border-radius: 16px; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4); max-width: 92vw; }
+.playback__img { width: 56px; height: 56px; object-fit: cover; border-radius: 10px; }
+.playback__info { min-width: 0; }
+.playback__date { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.playback__prog { font-size: 12px; opacity: 0.7; margin-top: 2px; }
+.playback__stop { border: none; background: rgba(255, 255, 255, 0.2); color: #fff; border-radius: 999px; padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+
+/* 数据看板 */
+.modal { position: absolute; inset: 0; z-index: 1400; background: rgba(0, 0, 0, 0.45); display: flex; align-items: center; justify-content: center; }
+.dash { position: relative; width: 340px; max-width: 88vw; background: rgba(255, 255, 255, 0.92); backdrop-filter: blur(18px); border-radius: 20px; padding: 24px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35); text-align: center; }
+.dash__title { font-size: 16px; font-weight: 700; color: #333; }
+.dash__km { margin-top: 16px; font-size: 52px; font-weight: 900; background: linear-gradient(135deg, #6366f1, #a855f7); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.dash__km span { font-size: 22px; }
+.dash__kmlabel { font-size: 13px; color: #888; margin-bottom: 18px; }
+.dash__grid { display: flex; gap: 10px; margin-bottom: 16px; }
+.dash__cell { flex: 1; background: rgba(99, 102, 241, 0.08); border-radius: 12px; padding: 12px 0; }
+.dash__cell b { display: block; font-size: 24px; color: #4f46e5; }
+.dash__cell span { font-size: 12px; color: #888; }
+.dash__row { display: flex; justify-content: space-between; font-size: 14px; padding: 8px 2px; border-top: 1px solid #eee; }
+.dash__row span { color: #888; }
+.dash__row b { color: #333; }
 </style>
