@@ -27,8 +27,14 @@ export async function drawPoster(stats, points) {
     ctx.fillText(span, W / 2, 182);
   }
 
-  // 足迹散点(经纬度归一化到框内)
-  drawScatter(ctx, points, { x: 90, y: 235, w: W - 180, h: 640 });
+  // 足迹路线(按时间顺序连线)
+  drawRoute(ctx, points, { x: 90, y: 235, w: W - 180, h: 640 });
+  if (points.length > 1) {
+    ctx.font = '400 26px system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.textAlign = 'center';
+    ctx.fillText('🟢 起点     🔴 终点', W / 2, 915);
+  }
 
   // 统计三连
   const sy = 985;
@@ -50,7 +56,8 @@ export async function drawPoster(stats, points) {
   return await new Promise((res) => c.toBlob(res, 'image/png'));
 }
 
-function drawScatter(ctx, points, box) {
+// points 需按时间顺序传入：连成路线，起点绿、终点红、途经点白
+function drawRoute(ctx, points, box) {
   ctx.fillStyle = 'rgba(255,255,255,0.12)';
   roundRect(ctx, box.x, box.y, box.w, box.h, 24);
   ctx.fill();
@@ -63,19 +70,30 @@ function drawScatter(ctx, points, box) {
   const maxLng = Math.max(...lngs);
   const spanLat = maxLat - minLat || 1;
   const spanLng = maxLng - minLng || 1;
-  const m = 44;
-  for (const p of points) {
-    const nx = (p.lng - minLng) / spanLng;
-    const ny = (p.lat - minLat) / spanLat;
-    const x = box.x + m + nx * (box.w - 2 * m);
-    const y = box.y + box.h - m - ny * (box.h - 2 * m); // 纬度大→靠上
+  const m = 46;
+  const pos = points.map((p) => ({
+    x: box.x + m + ((p.lng - minLng) / spanLng) * (box.w - 2 * m),
+    y: box.y + box.h - m - ((p.lat - minLat) / spanLat) * (box.h - 2 * m), // 纬度大→靠上
+  }));
+  if (pos.length > 1) {
     ctx.beginPath();
-    ctx.arc(x, y, 7, 0, Math.PI * 2);
-    ctx.fillStyle = '#fff';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+    ctx.moveTo(pos[0].x, pos[0].y);
+    for (let i = 1; i < pos.length; i++) ctx.lineTo(pos[i].x, pos[i].y);
+    ctx.strokeStyle = 'rgba(255,255,255,0.65)';
+    ctx.lineWidth = 3;
     ctx.stroke();
   }
+  pos.forEach((pt, i) => {
+    const isStart = i === 0;
+    const isEnd = i === pos.length - 1;
+    ctx.beginPath();
+    ctx.arc(pt.x, pt.y, isStart || isEnd ? 9 : 6, 0, Math.PI * 2);
+    ctx.fillStyle = isStart ? '#34d399' : isEnd ? '#f87171' : '#ffffff';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  });
 }
 
 function drawStat(ctx, x, y, num, label) {

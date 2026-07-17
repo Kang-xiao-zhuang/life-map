@@ -609,7 +609,8 @@ function zoomTo(photos) {
 
 async function onPoster() {
   try {
-    const pts = placed.value.map((p) => ({ lat: p.lat, lng: p.lng }));
+    const list = [...placed.value].sort((a, b) => ts(a.takenAt) - ts(b.takenAt));
+    const route = buildStops(list).map((s) => ({ lat: s.lat, lng: s.lng })); // 按时间的行程站点
     const cities = [...new Set(placed.value.map((p) => p.city).filter(Boolean))];
     const ys = years.value;
     const blob = await drawPoster(
@@ -621,7 +622,7 @@ async function onPoster() {
         yearTo: ys.length ? ys[0] : null,
         topCities: cities.slice(0, 8),
       },
-      pts,
+      route,
     );
     download(blob, `life-map-海报-${stamp()}.png`);
   } catch (e) {
