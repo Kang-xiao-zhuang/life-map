@@ -3,6 +3,7 @@
     <header class="topbar">
       <span class="topbar__title">🗺️ 我的人生地图</span>
       <div class="topbar__right">
+        <button class="btn btn--ghost" @click="toggleLang">{{ lang === 'zh' ? 'EN' : '中' }}</button>
         <button class="btn btn--ghost" @click="toggleTheme">{{ theme === 'dark' ? '☀️ 浅色' : '🌙 深色' }}</button>
         <input v-model="searchQ" class="search" placeholder="搜城市 / 备注" @keyup.enter="doSearch" />
         <span class="topbar__stat">城市 {{ cityCount }} · 足迹 {{ placed.length }} · 待定位 {{ pending.length }}</span>
@@ -148,6 +149,7 @@ import exifr from 'exifr';
 import { db } from './db.js';
 import { reverseCity } from './geocode.js';
 import { drawPoster } from './poster.js';
+import { wgs2gcj, gcj2wgs } from './gcj.js';
 
 const mapEl = ref(null);
 const placed = ref([]); // 已落点：{ id, lat, lng, takenAt, note, url }
@@ -227,8 +229,10 @@ let map;
 let markersLayer;
 const markers = new Map(); // id → L.marker
 const theme = ref(localStorage.getItem('life-map-theme') || 'dark');
+const lang = ref(localStorage.getItem('life-map-lang') || 'en');
 let darkLayer;
 let lightLayer;
+let gaodeLayer;
 
 onMounted(async () => {
   map = L.map(mapEl.value, { zoomControl: true }).setView([32.0, 108.0], 4);
@@ -241,7 +245,9 @@ onMounted(async () => {
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16, attribution: '&copy; Esri' }),
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16, attribution: '&copy; Esri' }),
   ]);
-  applyTheme();
+  // 中文底图：高德（GCJ-02 坐标 + 中文标注）；英文用上面的 Esri（WGS-84）
+  gaodeLayer = L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', { subdomains: '1234', maxZoom: 18, attribution: '&copy; 高德' });
+  applyBasemap();
   // 地点聚合：markercluster 自动按缩放把邻近足迹聚成数字气泡，放大自动散开，同点可展开
   markersLayer = L.markerClusterGroup({
     showCoverageOnHover: false,
@@ -272,16 +278,26 @@ onBeforeUnmount(() => {
   if (map) map.remove();
 });
 
-function applyTheme() {
+// 坐标换算：中文(高德)底图用 GCJ-02，英文(Esri)用 WGS-84。数据永远存 WGS-84。
+function toMap(lat, lng) { return lang.value === 'zh' ? wgs2gcj(lat, lng) : [lat, lng]; }
+function fromMap(lat, lng) { return lang.value === 'zh' ? gcj2wgs(lat, lng) : [lat, lng]; }
+
+function applyBasemap() {
   if (!map) return;
-  map.removeLayer(darkLayer);
-  map.removeLayer(lightLayer);
-  (theme.value === 'light' ? lightLayer : darkLayer).addTo(map);
+  [darkLayer, lightLayer, gaodeLayer].forEach((l) => l && map.removeLayer(l));
+  if (lang.value === 'zh') gaodeLayer.addTo(map);
+  else (theme.value === 'light' ? lightLayer : darkLayer).addTo(map);
 }
 function toggleTheme() {
   theme.value = theme.value === 'dark' ? 'light' : 'dark';
   localStorage.setItem('life-map-theme', theme.value);
-  applyTheme();
+  applyBasemap();
+}
+function toggleLang() {
+  lang.value = lang.value === 'en' ? 'zh' : 'en';
+  localStorage.setItem('life-map-lang', lang.value);
+  applyBasemap();
+  renderMarkers(); // 切底图后按新坐标系重投影所有钉子（WGS↔GCJ）
 }
 
 async function reload() {
@@ -382,8 +398,9 @@ async function onMapClick(e) {
   placingId.value = null;
   if (idx < 0) return;
   const p = pending.value[idx];
-  p.lat = e.latlng.lat;
-  p.lng = e.latlng.lng;
+  const [wlat, wlng] = fromMap(e.latlng.lat, e.latlng.lng); // 高德点击是 GCJ-02，转回 WGS-84 存库
+  p.lat = wlat;
+  p.lng = wlng;
   await db.photos.update(id, { lat: p.lat, lng: p.lng, placed: 1 });
   pending.value.splice(idx, 1);
   placed.value.push(p);
@@ -489,7 +506,7 @@ async function onImport(e) {
 
 // ---- 地图/工具 ----
 function addMarker(p) {
-  const m = L.marker([p.lat, p.lng], { icon: photoIcon(p.url), photoUrl: p.url });
+  const m = L.marker(toMap(p.lat, p.lng), { icon: photoIcon(p.url), photoUrl: p.url });
   m.on('click', () => openDetail(p));
   markersLayer.addLayer(m);
   markers.set(p.id, m);
@@ -502,7 +519,7 @@ function photoIcon(url) {
 function fitToPhotos() {
   const list = visiblePlaced.value;
   if (list.length) {
-    map.flyToBounds(L.latLngBounds(list.map((p) => [p.lat, p.lng])), { maxZoom: 12, padding: [60, 60], duration: 0.8 });
+    map.flyToBounds(L.latLngBounds(list.map((p) => toMap(p.lat, p.lng))), { maxZoom: 12, padding: [60, 60], duration: 0.8 });
   }
 }
 
@@ -521,7 +538,7 @@ function selectYear(y) { selectedYear.value = y; }
 
 function zoomTo(photos) {
   if (!photos.length) return;
-  map.flyToBounds(L.latLngBounds(photos.map((p) => [p.lat, p.lng])), { maxZoom: 13, padding: [60, 60], duration: 0.8 });
+  map.flyToBounds(L.latLngBounds(photos.map((p) => toMap(p.lat, p.lng))), { maxZoom: 13, padding: [60, 60], duration: 0.8 });
   reviewOpen.value = false;
 }
 
@@ -564,9 +581,10 @@ async function playJourney() {
     const s = stops[i];
     playCurrent.value = { url: s.photos[0].url, takenAt: s.photos[0].takenAt, city: s.region, count: s.photos.length };
     playProgress.value = { i: i + 1, total: stops.length };
-    coords.push([s.lat, s.lng]);
+    const [mlat, mlng] = toMap(s.lat, s.lng);
+    coords.push([mlat, mlng]);
     playLine.setLatLngs(coords);
-    map.flyTo([s.lat, s.lng], Math.max(map.getZoom(), 6), { duration: 1.1 });
+    map.flyTo([mlat, mlng], Math.max(map.getZoom(), 6), { duration: 1.1 });
     await sleep(1600);
   }
   playing.value = false;
@@ -684,7 +702,7 @@ function doSearch() {
   if (!q) return;
   const hits = placed.value.filter((p) => (p.city || '').includes(q) || (p.note || '').includes(q));
   if (!hits.length) { alert('没找到匹配的足迹'); return; }
-  map.flyToBounds(L.latLngBounds(hits.map((p) => [p.lat, p.lng])), { maxZoom: 12, padding: [60, 60], duration: 0.8 });
+  map.flyToBounds(L.latLngBounds(hits.map((p) => toMap(p.lat, p.lng))), { maxZoom: 12, padding: [60, 60], duration: 0.8 });
 }
 
 function openMemories() { if (memories.value.length) openLightbox(memories.value, 0); }
