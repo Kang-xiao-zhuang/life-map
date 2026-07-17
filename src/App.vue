@@ -20,6 +20,13 @@
     <div class="body" @dragover.prevent @drop.prevent="onDrop">
       <div ref="mapEl" class="map"></div>
 
+      <!-- 空状态引导 -->
+      <div v-if="!placed.length && !pending.length && !busy" class="empty">
+        <div class="empty__emoji">🗺️</div>
+        <div class="empty__title">开始你的人生地图</div>
+        <div class="empty__sub">把照片拖进来，或点右上「➕ 上传 / 📁 文件夹」</div>
+      </div>
+
       <!-- 去年今日 -->
       <div v-if="memories.length && !busy && !playing" class="memories" @click="openMemories">🎁 去年今日 · {{ memories.length }} 张回忆</div>
 
@@ -235,6 +242,8 @@ let lightLayer;
 let gaodeLayer;
 
 onMounted(async () => {
+  // 请求持久化存储，避免浏览器在磁盘紧张时回收掉本地照片数据
+  if (navigator.storage?.persist) navigator.storage.persist();
   map = L.map(mapEl.value, { zoomControl: true }).setView([32.0, 108.0], 4);
   // 深/浅两套底图（Esri 灰底 Canvas，都是 WGS-84、国内可访问），由顶部按钮切换
   darkLayer = L.layerGroup([
@@ -301,6 +310,7 @@ function toggleLang() {
 }
 
 async function reload() {
+  [...placed.value, ...pending.value].forEach((p) => p.url && URL.revokeObjectURL(p.url)); // 回收旧的 blob URL
   markersLayer.clearLayers();
   markers.clear();
   placed.value = [];
@@ -423,6 +433,9 @@ async function saveNote() {
 }
 
 async function deletePhoto(id) {
+  if (!confirm('确定删除这张照片？')) return;
+  const gone = [...placed.value, ...pending.value].find((x) => x.id === id);
+  if (gone?.url) URL.revokeObjectURL(gone.url);
   await db.photos.delete(id);
   const m = markers.get(id);
   if (m) { markersLayer.removeLayer(m); markers.delete(id); }
@@ -435,6 +448,7 @@ async function deletePhoto(id) {
 async function clearAll() {
   if (!confirm('确定清空所有照片和足迹？此操作不可撤销（建议先「导出」备份）。')) return;
   await db.photos.clear();
+  [...placed.value, ...pending.value].forEach((p) => p.url && URL.revokeObjectURL(p.url)); // 回收 blob URL
   stopJourney(); // 去掉回放动画线
   if (provinceLayer) { map.removeLayer(provinceLayer); provinceLayer = null; provincesOn.value = false; } // 收起省份高亮
   markersLayer.clearLayers();
@@ -880,4 +894,10 @@ html, body, #app { height: 100%; margin: 0; }
 
 /* 浅色主题：底图变亮时，面板略加不透明度以保证对比 */
 .app.theme-light .drawer, .app.theme-light .review, .app.theme-light .tray { background: rgba(255, 255, 255, 0.86); }
+
+/* 空状态引导 */
+.empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 500; text-align: center; pointer-events: none; background: rgba(0, 0, 0, 0.42); backdrop-filter: blur(6px); color: #fff; padding: 28px 36px; border-radius: 20px; }
+.empty__emoji { font-size: 48px; }
+.empty__title { font-size: 20px; font-weight: 700; margin-top: 8px; }
+.empty__sub { font-size: 13px; opacity: 0.85; margin-top: 6px; }
 </style>
