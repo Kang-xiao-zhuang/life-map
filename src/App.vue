@@ -9,7 +9,7 @@
         <span class="topbar__stat">城市 {{ cityCount }} · 足迹 {{ placed.length }} · 待定位 {{ pending.length }}</span>
         <label class="btn">➕ 上传<input type="file" accept="image/*" multiple hidden @change="onFiles" /></label>
         <label class="btn">📁 文件夹<input type="file" accept="image/*" webkitdirectory multiple hidden @change="onFiles" /></label>
-        <label class="btn btn--ghost">📥 导入<input type="file" accept="application/json,.json" hidden @change="onImport" /></label>
+        <label class="btn btn--ghost">📥 导入<input type="file" accept="application/json,.json,.zip" hidden @change="onImport" /></label>
         <button class="btn btn--ghost" @click="reviewOpen = !reviewOpen">🕐 回顾</button>
         <button class="btn btn--ghost" @click="onPoster">🖼️ 海报</button>
         <button class="btn btn--ghost" @click="onExport">📤 导出</button>
@@ -277,6 +277,7 @@ onMounted(async () => {
   }).addTo(map);
   map.on('click', onMapClick);
   window.addEventListener('keydown', onKey);
+  window.addEventListener('resize', onResize);
   setTimeout(() => map.invalidateSize(), 200);
 
   await reload();
@@ -284,8 +285,11 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKey);
+  window.removeEventListener('resize', onResize);
   if (map) map.remove();
 });
+
+function onResize() { if (map) map.invalidateSize(); }
 
 // 坐标换算：中文(高德)底图用 GCJ-02，英文(Esri)用 WGS-84。数据永远存 WGS-84。
 function toMap(lat, lng) { return lang.value === 'zh' ? wgs2gcj(lat, lng) : [lat, lng]; }
@@ -319,14 +323,12 @@ async function reload() {
   for (const rec of all) {
     const url = URL.createObjectURL(rec.blob);
     if (Number.isFinite(rec.lat) && Number.isFinite(rec.lng)) {
-      const p = { id: rec.id, lat: rec.lat, lng: rec.lng, takenAt: rec.takenAt, note: rec.note || '', city: rec.city, url };
-      placed.value.push(p);
-      addMarker(p);
+      placed.value.push({ id: rec.id, lat: rec.lat, lng: rec.lng, takenAt: rec.takenAt, note: rec.note || '', city: rec.city, url });
     } else {
       pending.value.push({ id: rec.id, takenAt: rec.takenAt, note: rec.note || '', url });
     }
   }
-  fitToPhotos();
+  renderMarkers();
   geocodePending();
 }
 
@@ -363,9 +365,7 @@ async function processFiles(fileList) {
       await db.photos.add(rec);
       const url = URL.createObjectURL(blob);
       if (hasGeo) {
-        const p = { id: rec.id, lat: rec.lat, lng: rec.lng, takenAt, note: '', url };
-        placed.value.push(p);
-        addMarker(p);
+        placed.value.push({ id: rec.id, lat: rec.lat, lng: rec.lng, takenAt, note: '', url });
       } else {
         pending.value.push({ id: rec.id, takenAt, note: '', url });
       }
@@ -375,7 +375,7 @@ async function processFiles(fileList) {
     busy.value.done++;
   }
   busy.value = null;
-  fitToPhotos();
+  renderMarkers();
   geocodePending();
 }
 
@@ -414,7 +414,7 @@ async function onMapClick(e) {
   await db.photos.update(id, { lat: p.lat, lng: p.lng, placed: 1 });
   pending.value.splice(idx, 1);
   placed.value.push(p);
-  addMarker(p);
+  renderMarkers();
   geocodePending();
 }
 
@@ -437,12 +437,11 @@ async function deletePhoto(id) {
   const gone = [...placed.value, ...pending.value].find((x) => x.id === id);
   if (gone?.url) URL.revokeObjectURL(gone.url);
   await db.photos.delete(id);
-  const m = markers.get(id);
-  if (m) { markersLayer.removeLayer(m); markers.delete(id); }
   placed.value = placed.value.filter((x) => x.id !== id);
   pending.value = pending.value.filter((x) => x.id !== id);
   if (selected.value?.id === id) selected.value = null;
   if (placingId.value === id) placingId.value = null;
+  renderMarkers();
 }
 
 async function clearAll() {
@@ -481,16 +480,19 @@ async function onExport() {
   try {
     const all = await db.photos.toArray();
     if (!all.length) { alert('还没有照片可导出'); return; }
-    const items = [];
+    const { default: JSZip } = await import('jszip'); // 懒加载
+    const zip = new JSZip();
+    const folder = zip.folder('photos');
+    const meta = [];
     for (const r of all) {
-      items.push({
-        id: r.id, lat: r.lat, lng: r.lng,
-        takenAt: r.takenAt, note: r.note || '', city: r.city, placed: r.placed, createdAt: r.createdAt,
-        image: await blobToDataUrl(r.blob),
-      });
+      const ext = (r.blob.type || '').includes('png') ? 'png' : 'jpg';
+      const file = `${r.id}.${ext}`;
+      folder.file(file, r.blob);
+      meta.push({ id: r.id, lat: r.lat, lng: r.lng, takenAt: r.takenAt, note: r.note || '', city: r.city, placed: r.placed, createdAt: r.createdAt, file });
     }
-    const json = JSON.stringify({ app: 'life-map', version: 1, photos: items });
-    download(new Blob([json], { type: 'application/json' }), `life-map-备份-${stamp()}.json`);
+    zip.file('data.json', JSON.stringify({ app: 'life-map', version: 2, photos: meta }));
+    const blob = await zip.generateAsync({ type: 'blob' });
+    download(blob, `life-map-备份-${stamp()}.zip`);
   } catch (e) {
     alert('导出失败：' + (e?.message || e));
   }
@@ -501,35 +503,82 @@ async function onImport(e) {
   e.target.value = '';
   if (!file) return;
   try {
-    const data = JSON.parse(await file.text());
-    const list = Array.isArray(data) ? data : data.photos;
-    if (!Array.isArray(list)) throw new Error('文件格式不对');
-    for (const it of list) {
-      await db.photos.put({
-        id: it.id, blob: await dataUrlToBlob(it.image),
-        lat: it.lat ?? null, lng: it.lng ?? null,
-        takenAt: it.takenAt ? new Date(it.takenAt) : new Date(),
-        note: it.note || '', city: it.city, placed: it.placed ? 1 : 0,
-        createdAt: it.createdAt ? new Date(it.createdAt) : new Date(),
-      });
-    }
+    if (/\.zip$/i.test(file.name)) await importZip(file);
+    else await importJson(file);
     await reload();
     alert('导入完成');
   } catch (err) {
-    alert('导入失败：' + err.message);
+    alert('导入失败：' + (err?.message || err));
+  }
+}
+
+// 旧版 JSON 备份（图片 base64）
+async function importJson(file) {
+  const data = JSON.parse(await file.text());
+  const list = Array.isArray(data) ? data : data.photos;
+  if (!Array.isArray(list)) throw new Error('文件格式不对');
+  for (const it of list) {
+    await db.photos.put({
+      id: it.id, blob: await dataUrlToBlob(it.image),
+      lat: it.lat ?? null, lng: it.lng ?? null,
+      takenAt: it.takenAt ? new Date(it.takenAt) : new Date(),
+      note: it.note || '', city: it.city, placed: it.placed ? 1 : 0,
+      createdAt: it.createdAt ? new Date(it.createdAt) : new Date(),
+    });
+  }
+}
+
+// 新版 ZIP 备份（photos/ 目录 + data.json）
+async function importZip(file) {
+  const { default: JSZip } = await import('jszip');
+  const zip = await JSZip.loadAsync(file);
+  const dataFile = zip.file('data.json');
+  if (!dataFile) throw new Error('压缩包缺少 data.json');
+  const data = JSON.parse(await dataFile.async('string'));
+  for (const it of data.photos || []) {
+    const pf = it.file && zip.file('photos/' + it.file);
+    if (!pf) continue;
+    const ab = await pf.async('arraybuffer');
+    const blob = new Blob([ab], { type: it.file.endsWith('png') ? 'image/png' : 'image/jpeg' });
+    await db.photos.put({
+      id: it.id, blob,
+      lat: it.lat ?? null, lng: it.lng ?? null,
+      takenAt: it.takenAt ? new Date(it.takenAt) : new Date(),
+      note: it.note || '', city: it.city, placed: it.placed ? 1 : 0,
+      createdAt: it.createdAt ? new Date(it.createdAt) : new Date(),
+    });
   }
 }
 
 // ---- 地图/工具 ----
-function addMarker(p) {
-  const m = L.marker(toMap(p.lat, p.lng), { icon: photoIcon(p.url), photoUrl: p.url });
-  m.on('click', () => openDetail(p));
-  markersLayer.addLayer(m);
-  markers.set(p.id, m);
+// 点级聚合：把 ~11m 内的照片归为同一地点，一个钉子代表一组
+function groupBySpot(list) {
+  const g = new Map();
+  for (const p of list) {
+    const key = `${p.lat.toFixed(4)},${p.lng.toFixed(4)}`;
+    if (!g.has(key)) g.set(key, { lat: p.lat, lng: p.lng, photos: [] });
+    g.get(key).photos.push(p);
+  }
+  return [...g.values()];
 }
 
-function photoIcon(url) {
-  return L.divIcon({ className: 'photo-pin', html: `<img src="${url}" alt="" />`, iconSize: [48, 48], iconAnchor: [24, 24] });
+function addGroupMarker(group) {
+  const cover = group.photos[0];
+  const n = group.photos.length;
+  const m = L.marker(toMap(group.lat, group.lng), { icon: spotIcon(cover.url, n), photoUrl: cover.url });
+  m.on('click', () => (n > 1 ? openLightbox(group.photos, 0) : openDetail(cover)));
+  markersLayer.addLayer(m);
+  markers.set(cover.id, m);
+}
+
+function spotIcon(url, n) {
+  const badge = n > 1 ? `<span class="photo-pin__badge">${n}</span>` : '';
+  return L.divIcon({
+    className: 'photo-pin',
+    html: `<div class="photo-pin__wrap"><img src="${url}" alt="" />${badge}</div>`,
+    iconSize: [48, 48],
+    iconAnchor: [24, 24],
+  });
 }
 
 function fitToPhotos() {
@@ -546,7 +595,7 @@ function ts(d) { return (d instanceof Date ? d : new Date(d)).getTime(); }
 function renderMarkers() {
   markersLayer.clearLayers();
   markers.clear();
-  for (const p of visiblePlaced.value) addMarker(p);
+  for (const g of groupBySpot(visiblePlaced.value)) addGroupMarker(g);
   fitToPhotos();
 }
 
@@ -826,6 +875,8 @@ html, body, #app { height: 100%; margin: 0; }
 
 .photo-pin img { width: 48px; height: 48px; object-fit: cover; border-radius: 8px; border: 2px solid #fff; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5); transition: transform 0.15s ease; animation: pin-drop 0.35s ease both; }
 .photo-pin img:hover { transform: scale(1.18); }
+.photo-pin__wrap { position: relative; width: 48px; height: 48px; }
+.photo-pin__badge { position: absolute; top: -6px; right: -6px; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 999px; background: #6366f1; color: #fff; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4); }
 .leaflet-marker-icon:hover { z-index: 1000 !important; }
 
 /* 聚合气泡：照片封面 + 数字角标 */
@@ -900,4 +951,19 @@ html, body, #app { height: 100%; margin: 0; }
 .empty__emoji { font-size: 48px; }
 .empty__title { font-size: 20px; font-weight: 700; margin-top: 8px; }
 .empty__sub { font-size: 13px; opacity: 0.85; margin-top: 6px; }
+
+/* 移动端适配 */
+@media (max-width: 640px) {
+  .topbar { height: auto; flex-wrap: wrap; padding: 8px 12px; gap: 6px; }
+  .topbar__right { flex-wrap: wrap; gap: 6px; }
+  .topbar__title { font-size: 15px; }
+  .topbar__stat { font-size: 11px; }
+  .search { width: 120px; }
+  .btn { padding: 6px 9px; font-size: 12px; }
+  .drawer, .review { width: 100%; max-width: 100%; }
+  .album__grid { grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); }
+  .fabs { right: 12px; bottom: 24px; }
+  .fab { width: 42px; height: 42px; font-size: 16px; }
+  .playback { max-width: 94vw; }
+}
 </style>
