@@ -1,8 +1,10 @@
 <template>
-  <div class="app">
+  <div class="app" :class="'theme-' + theme">
     <header class="topbar">
       <span class="topbar__title">🗺️ 我的人生地图</span>
       <div class="topbar__right">
+        <button class="btn btn--ghost" @click="toggleTheme">{{ theme === 'dark' ? '☀️ 浅色' : '🌙 深色' }}</button>
+        <input v-model="searchQ" class="search" placeholder="搜城市 / 备注" @keyup.enter="doSearch" />
         <span class="topbar__stat">城市 {{ cityCount }} · 足迹 {{ placed.length }} · 待定位 {{ pending.length }}</span>
         <label class="btn">➕ 上传<input type="file" accept="image/*" multiple hidden @change="onFiles" /></label>
         <label class="btn">📁 文件夹<input type="file" accept="image/*" webkitdirectory multiple hidden @change="onFiles" /></label>
@@ -17,6 +19,9 @@
     <div class="body" @dragover.prevent @drop.prevent="onDrop">
       <div ref="mapEl" class="map"></div>
 
+      <!-- 去年今日 -->
+      <div v-if="memories.length && !busy && !playing" class="memories" @click="openMemories">🎁 去年今日 · {{ memories.length }} 张回忆</div>
+
       <!-- 批量处理进度 -->
       <div v-if="busy" class="progress">⏳ 处理中 {{ busy.done }}/{{ busy.total }}…</div>
 
@@ -29,7 +34,7 @@
       <!-- 详情抽屉 -->
       <aside v-if="selected" class="drawer">
         <button class="drawer__close" @click="selected = null">✕</button>
-        <img :src="selected.url" class="drawer__img" />
+        <img :src="selected.url" class="drawer__img" title="点击全屏查看" @click="openFromDrawer" />
         <div class="drawer__date">📅 {{ fmt(selected.takenAt) }}<span v-if="selected.city"> · 📍 {{ selected.city }}</span></div>
         <textarea v-model="draftNote" class="drawer__note" placeholder="写点什么…（这次拍摄的故事）"></textarea>
         <div class="drawer__actions">
@@ -59,6 +64,7 @@
 
       <!-- 悬浮功能按钮 -->
       <div class="fabs">
+        <button class="fab" title="相册" @click="albumOpen = true">▦</button>
         <button class="fab" :class="{ 'fab--on': provincesOn }" title="点亮省份" @click="toggleProvinces">🗺️</button>
         <button class="fab" title="数据看板" @click="statsOpen = true">📊</button>
         <button class="fab fab--play" title="旅程回放" @click="playJourney">▶</button>
@@ -103,6 +109,30 @@
           </div>
         </div>
       </footer>
+    </div>
+
+    <!-- 全屏 lightbox -->
+    <div v-if="lightbox" class="lb" @click.self="lbClose">
+      <button class="lb__close" @click="lbClose">✕</button>
+      <button v-if="lightbox.list.length > 1" class="lb__nav lb__prev" @click="lbGo(-1)">‹</button>
+      <img :src="lightbox.list[lightbox.index].url" class="lb__img" />
+      <button v-if="lightbox.list.length > 1" class="lb__nav lb__next" @click="lbGo(1)">›</button>
+      <div class="lb__cap">
+        <span v-if="lightbox.list[lightbox.index].city">📍 {{ lightbox.list[lightbox.index].city }} · </span>{{ fmt(lightbox.list[lightbox.index].takenAt) }}
+        <span class="lb__idx">（{{ lightbox.index + 1 }}/{{ lightbox.list.length }}）</span>
+        <div v-if="lightbox.list[lightbox.index].note" class="lb__note">{{ lightbox.list[lightbox.index].note }}</div>
+      </div>
+    </div>
+
+    <!-- 相册网格 -->
+    <div v-if="albumOpen" class="album">
+      <div class="album__head">
+        <span class="album__title">🖼️ 相册 · {{ allPhotos.length }} 张</span>
+        <button class="drawer__close" @click="albumOpen = false">✕</button>
+      </div>
+      <div class="album__grid">
+        <img v-for="(p, i) in allPhotos" :key="p.id" :src="p.url" @click="openLightbox(allPhotos, i)" />
+      </div>
     </div>
   </div>
 </template>
@@ -179,27 +209,39 @@ let playAbort = false;
 let provinceLayer = null;
 let provincesGeo = null;
 
+// 锦上：lightbox / 相册 / 搜索 / 去年今日
+const lightbox = ref(null); // { list, index }
+const albumOpen = ref(false);
+const searchQ = ref('');
+const allPhotos = computed(() => [...placed.value, ...pending.value].sort((a, b) => ts(b.takenAt) - ts(a.takenAt)));
+const memories = computed(() => {
+  const now = new Date();
+  const md = `${now.getMonth()}-${now.getDate()}`;
+  return allPhotos.value.filter((p) => {
+    const d = p.takenAt instanceof Date ? p.takenAt : new Date(p.takenAt);
+    return `${d.getMonth()}-${d.getDate()}` === md && d.getFullYear() < now.getFullYear();
+  });
+});
+
 let map;
 let markersLayer;
 const markers = new Map(); // id → L.marker
+const theme = ref(localStorage.getItem('life-map-theme') || 'dark');
+let darkLayer;
+let lightLayer;
 
 onMounted(async () => {
   map = L.map(mapEl.value, { zoomControl: true }).setView([32.0, 108.0], 4);
-  const esriStreet = L.tileLayer(
-    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
-    { maxZoom: 19, attribution: '&copy; Esri' },
-  );
-  const esriImagery = L.tileLayer(
-    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    { maxZoom: 19, attribution: '&copy; Esri' },
-  );
-  // 精致深色底图（灰底 + 单独的标注层），照片钉子在深色上更亮眼
-  const dark = L.layerGroup([
+  // 深/浅两套底图（Esri 灰底 Canvas，都是 WGS-84、国内可访问），由顶部按钮切换
+  darkLayer = L.layerGroup([
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16, attribution: '&copy; Esri' }),
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16, attribution: '&copy; Esri' }),
   ]);
-  dark.addTo(map); // 默认深色
-  L.control.layers({ '深色': dark, '街道': esriStreet, '卫星': esriImagery }, {}, { collapsed: false }).addTo(map);
+  lightLayer = L.layerGroup([
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16, attribution: '&copy; Esri' }),
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16, attribution: '&copy; Esri' }),
+  ]);
+  applyTheme();
   // 地点聚合：markercluster 自动按缩放把邻近足迹聚成数字气泡，放大自动散开，同点可展开
   markersLayer = L.markerClusterGroup({
     showCoverageOnHover: false,
@@ -219,14 +261,28 @@ onMounted(async () => {
     },
   }).addTo(map);
   map.on('click', onMapClick);
+  window.addEventListener('keydown', onKey);
   setTimeout(() => map.invalidateSize(), 200);
 
   await reload();
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKey);
   if (map) map.remove();
 });
+
+function applyTheme() {
+  if (!map) return;
+  map.removeLayer(darkLayer);
+  map.removeLayer(lightLayer);
+  (theme.value === 'light' ? lightLayer : darkLayer).addTo(map);
+}
+function toggleTheme() {
+  theme.value = theme.value === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('life-map-theme', theme.value);
+  applyTheme();
+}
 
 async function reload() {
   markersLayer.clearLayers();
@@ -605,6 +661,41 @@ function pointInRing(x, y, ring) {
   return inside;
 }
 
+// ---- 8/9. lightbox / 相册 / 搜索 / 去年今日 ----
+function openLightbox(list, index) { lightbox.value = { list, index }; }
+function lbGo(delta) {
+  if (!lightbox.value) return;
+  const n = lightbox.value.list.length;
+  lightbox.value.index = (lightbox.value.index + delta + n) % n;
+}
+function lbClose() { lightbox.value = null; }
+
+// 从详情抽屉点大图 → 打开同地区的照片组
+function openFromDrawer() {
+  const s = selected.value;
+  if (!s) return;
+  const key = s.city || `${s.lat.toFixed(1)},${s.lng.toFixed(1)}`;
+  const list = placed.value.filter((p) => (p.city || `${p.lat.toFixed(1)},${p.lng.toFixed(1)}`) === key);
+  openLightbox(list, Math.max(0, list.findIndex((p) => p.id === s.id)));
+}
+
+function doSearch() {
+  const q = searchQ.value.trim();
+  if (!q) return;
+  const hits = placed.value.filter((p) => (p.city || '').includes(q) || (p.note || '').includes(q));
+  if (!hits.length) { alert('没找到匹配的足迹'); return; }
+  map.flyToBounds(L.latLngBounds(hits.map((p) => [p.lat, p.lng])), { maxZoom: 12, padding: [60, 60], duration: 0.8 });
+}
+
+function openMemories() { if (memories.value.length) openLightbox(memories.value, 0); }
+
+function onKey(e) {
+  if (!lightbox.value) return;
+  if (e.key === 'ArrowLeft') lbGo(-1);
+  else if (e.key === 'ArrowRight') lbGo(1);
+  else if (e.key === 'Escape') lbClose();
+}
+
 async function makeThumb(file, maxSize = 1200, quality = 0.82) {
   try {
     const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
@@ -739,4 +830,34 @@ html, body, #app { height: 100%; margin: 0; }
 .dash__row { display: flex; justify-content: space-between; font-size: 14px; padding: 8px 2px; border-top: 1px solid #eee; }
 .dash__row span { color: #888; }
 .dash__row b { color: #333; }
+
+/* 搜索框 */
+.search { width: 150px; border: none; border-radius: 999px; padding: 6px 12px; font-size: 13px; background: rgba(255, 255, 255, 0.9); outline: none; }
+
+/* 去年今日 */
+.memories { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 1150; background: linear-gradient(135deg, #f59e0b, #ef4444); color: #fff; padding: 8px 16px; border-radius: 999px; font-size: 13px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3); }
+.memories:hover { filter: brightness(1.05); }
+
+/* 全屏 lightbox */
+.lb { position: absolute; inset: 0; z-index: 1500; background: rgba(0, 0, 0, 0.9); display: flex; align-items: center; justify-content: center; }
+.lb__img { max-width: 92vw; max-height: 82vh; border-radius: 8px; box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6); }
+.lb__close { position: absolute; top: 16px; right: 20px; z-index: 2; width: 40px; height: 40px; border-radius: 50%; border: none; background: rgba(255, 255, 255, 0.15); color: #fff; font-size: 18px; cursor: pointer; }
+.lb__nav { position: absolute; top: 50%; transform: translateY(-50%); z-index: 2; width: 52px; height: 52px; border-radius: 50%; border: none; background: rgba(255, 255, 255, 0.15); color: #fff; font-size: 30px; cursor: pointer; }
+.lb__prev { left: 16px; }
+.lb__next { right: 16px; }
+.lb__nav:hover, .lb__close:hover { background: rgba(255, 255, 255, 0.3); }
+.lb__cap { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); max-width: 90vw; text-align: center; color: #fff; font-size: 14px; background: rgba(0, 0, 0, 0.4); padding: 8px 16px; border-radius: 12px; }
+.lb__idx { opacity: 0.7; }
+.lb__note { margin-top: 6px; font-size: 13px; opacity: 0.9; }
+
+/* 相册网格 */
+.album { position: absolute; inset: 0; z-index: 1450; background: rgba(20, 20, 24, 0.96); display: flex; flex-direction: column; }
+.album__head { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; color: #fff; }
+.album__title { font-size: 16px; font-weight: 700; }
+.album__grid { flex: 1; overflow-y: auto; padding: 0 12px 16px; display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
+.album__grid img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 8px; cursor: pointer; transition: transform 0.12s; }
+.album__grid img:hover { transform: scale(1.04); }
+
+/* 浅色主题：底图变亮时，面板略加不透明度以保证对比 */
+.app.theme-light .drawer, .app.theme-light .review, .app.theme-light .tray { background: rgba(255, 255, 255, 0.86); }
 </style>
