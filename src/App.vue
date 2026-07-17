@@ -435,6 +435,8 @@ async function deletePhoto(id) {
 async function clearAll() {
   if (!confirm('确定清空所有照片和足迹？此操作不可撤销（建议先「导出」备份）。')) return;
   await db.photos.clear();
+  stopJourney(); // 去掉回放动画线
+  if (provinceLayer) { map.removeLayer(provinceLayer); provinceLayer = null; provincesOn.value = false; } // 收起省份高亮
   markersLayer.clearLayers();
   markers.clear();
   placed.value = [];
