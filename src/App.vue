@@ -12,6 +12,10 @@
         <label class="btn btn--ghost">📥 导入<input type="file" accept="application/json,.json,.zip" hidden @change="onImport" /></label>
         <button class="btn btn--ghost" @click="reviewOpen = !reviewOpen">🕐 回顾</button>
         <button class="btn btn--ghost" @click="onPoster">🖼️ 海报</button>
+        <span v-if="backupWarn" class="backup">
+          <button class="backup__btn" @click="onExport" title="数据全在本地浏览器，点此导出备份">⚠️ {{ backupText }} · 导出</button>
+          <button class="backup__x" @click="backupDismissed = true" title="本次先不提醒">✕</button>
+        </span>
         <button class="btn btn--ghost" @click="onExport">📤 导出</button>
         <button class="btn btn--danger" @click="clearAll">🧹 清空</button>
       </div>
@@ -201,6 +205,18 @@ const draftNote = ref('');
 const placingId = ref(null); // 正在放置的待定位照片 id
 const selectedPending = ref([]); // 多选待定位的 id
 const placingBatch = ref(false); // 批量放置模式
+// 备份提醒：数据全在本地，超过阈值没导出就提醒
+const BACKUP_DAYS = 14;
+const lastExport = ref(localStorage.getItem('life-map-last-export'));
+const backupDismissed = ref(false);
+const daysSinceExport = computed(() => (lastExport.value ? Math.floor((Date.now() - Number(lastExport.value)) / 86400000) : null));
+const backupWarn = computed(() => {
+  if (backupDismissed.value) return false;
+  if (!placed.value.length && !pending.value.length) return false; // 没数据不提醒
+  if (!lastExport.value) return true; // 有数据但从没备份过
+  return daysSinceExport.value >= BACKUP_DAYS;
+});
+const backupText = computed(() => (lastExport.value ? `已 ${daysSinceExport.value} 天未备份` : '还没备份过'));
 const busy = ref(null); // 批量处理进度 { done, total }
 const cityCount = computed(() => new Set(placed.value.map((p) => p.city).filter(Boolean)).size);
 let geocoding = false;
@@ -620,6 +636,9 @@ async function onExport() {
     zip.file('data.json', JSON.stringify({ app: 'life-map', version: 2, photos: meta }));
     const blob = await zip.generateAsync({ type: 'blob' });
     download(blob, `life-map-备份-${stamp()}.zip`);
+    lastExport.value = String(Date.now()); // 记下备份时间，清掉提醒
+    localStorage.setItem('life-map-last-export', lastExport.value);
+    backupDismissed.value = false;
   } catch (e) {
     alert('导出失败：' + (e?.message || e));
   }
@@ -1075,6 +1094,13 @@ html, body, #app { height: 100%; margin: 0; }
 .btn--ghost { background: rgba(255, 255, 255, 0.14); }
 .btn--primary { background: #6366f1; }
 .btn--danger { background: #ef4444; }
+/* 备份提醒 */
+.backup { display: inline-flex; align-items: center; gap: 2px; }
+.backup__btn { cursor: pointer; font-size: 13px; font-weight: 700; padding: 7px 12px; border: none; border-radius: 999px 0 0 999px; background: #f59e0b; color: #fff; box-shadow: 0 2px 10px rgba(245, 158, 11, 0.5); animation: backup-pulse 2s ease-in-out infinite; }
+.backup__btn:hover { filter: brightness(1.06); }
+.backup__x { cursor: pointer; font-size: 12px; padding: 7px 9px; border: none; border-radius: 0 999px 999px 0; background: rgba(245, 158, 11, 0.55); color: #fff; }
+.backup__x:hover { background: rgba(245, 158, 11, 0.8); }
+@keyframes backup-pulse { 0%, 100% { box-shadow: 0 2px 10px rgba(245, 158, 11, 0.5); } 50% { box-shadow: 0 2px 16px rgba(245, 158, 11, 0.85); } }
 
 .body { flex: 1; position: relative; overflow: hidden; }
 .map { position: absolute; inset: 0; }
