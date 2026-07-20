@@ -214,6 +214,7 @@ const dateRange = computed(() => {
   return `${fmt(new Date(ds[0]))} ~ ${fmt(new Date(ds[ds.length - 1]))}`;
 });
 let playLine = null;
+let planeMarker = null;
 let playAbort = false;
 let provinceLayer = null;
 let provincesGeo = null;
@@ -415,6 +416,7 @@ async function onMapClick(e) {
   pending.value.splice(idx, 1);
   placed.value.push(p);
   renderMarkers();
+  pulseAt(p.lat, p.lng); // 点亮这个新地方
   geocodePending();
 }
 
@@ -562,6 +564,16 @@ function groupBySpot(list) {
   return [...g.values()];
 }
 
+// 点亮动画：在某坐标炸开一圈暖光后自动消失
+function pulseAt(lat, lng) {
+  const m = L.marker(toMap(lat, lng), {
+    icon: L.divIcon({ className: 'lightup', html: '', iconSize: [0, 0] }),
+    interactive: false,
+    zIndexOffset: 900,
+  }).addTo(map);
+  setTimeout(() => { if (map.hasLayer(m)) map.removeLayer(m); }, 1200);
+}
+
 function addGroupMarker(group) {
   const cover = group.photos[0];
   const n = group.photos.length;
@@ -640,21 +652,86 @@ async function playJourney() {
   playAbort = false;
   playing.value = true;
   if (playLine) map.removeLayer(playLine);
-  playLine = L.polyline([], { color: '#a855f7', weight: 3, opacity: 0.9 }).addTo(map);
-  const coords = [];
-  for (let i = 0; i < stops.length; i++) {
+  if (planeMarker) map.removeLayer(planeMarker);
+  playLine = L.polyline([], { color: '#5ac8ff', weight: 2.5, opacity: 0.95, className: 'journey-arc', dashArray: '1 9', lineCap: 'round' }).addTo(map);
+  const drawn = []; // 累计的弧线点，一路点亮
+
+  const info = (s) => ({ url: s.photos[0].url, takenAt: s.photos[0].takenAt, city: s.region, count: s.photos.length });
+
+  // 起点
+  const first = toMap(stops[0].lat, stops[0].lng);
+  planeMarker = L.marker(first, { icon: planeIcon(0), interactive: false, zIndexOffset: 1000 }).addTo(map);
+  playCurrent.value = info(stops[0]);
+  playProgress.value = { i: 1, total: stops.length };
+  drawn.push(first);
+  playLine.setLatLngs(drawn);
+  map.flyTo(first, Math.max(map.getZoom(), 6), { duration: 1.0 });
+  await sleep(1300);
+
+  for (let i = 1; i < stops.length; i++) {
     if (playAbort) break;
     const s = stops[i];
-    playCurrent.value = { url: s.photos[0].url, takenAt: s.photos[0].takenAt, city: s.region, count: s.photos.length };
     playProgress.value = { i: i + 1, total: stops.length };
-    const [mlat, mlng] = toMap(s.lat, s.lng);
-    coords.push([mlat, mlng]);
-    playLine.setLatLngs(coords);
-    map.flyTo([mlat, mlng], Math.max(map.getZoom(), 6), { duration: 1.1 });
-    await sleep(1600);
+    const from = toMap(stops[i - 1].lat, stops[i - 1].lng);
+    const to = toMap(s.lat, s.lng);
+    // 相机拉到能看见这一段航线
+    map.flyToBounds(L.latLngBounds([from, to]).pad(0.35), { duration: 0.9, maxZoom: 9 });
+    await sleep(950);
+    if (playAbort) break;
+    // 沿弧线飞：飞机跟着走 + 航迹一节节点亮
+    const arc = arcPoints(from, to, 48);
+    for (let k = 0; k < arc.length; k++) {
+      if (playAbort) break;
+      drawn.push(arc[k]);
+      playLine.setLatLngs(drawn);
+      const next = arc[Math.min(k + 1, arc.length - 1)];
+      const prev = arc[Math.max(k - 1, 0)];
+      planeMarker.setLatLng(arc[k]);
+      planeMarker.setIcon(planeIcon(bearing(prev, next) - 45)); // ✈️ 默认朝东北，减 45° 对齐航向
+      await sleep(22);
+    }
+    playCurrent.value = info(s); // 抵达后翻到这一站的卡片
+    await sleep(750);
   }
   playing.value = false;
   playCurrent.value = null;
+  if (planeMarker) { map.removeLayer(planeMarker); planeMarker = null; }
+}
+
+// ✈️ 图标，rot=旋转角度（度）
+function planeIcon(rot) {
+  return L.divIcon({
+    className: 'plane-fly',
+    html: `<div class="plane-fly__i" style="transform: rotate(${rot}deg)">✈️</div>`,
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
+  });
+}
+
+// 两点间的弧线（二次贝塞尔，控制点在中点垂直方向抬起，形成航线弧顶）
+function arcPoints(from, to, n = 48) {
+  const [lat0, lng0] = from;
+  const [lat1, lng1] = to;
+  const dLat = lat1 - lat0;
+  const dLng = lng1 - lng0;
+  const k = 0.35; // 弧的弯度：越大弧越鼓
+  const cLat = (lat0 + lat1) / 2 + -dLng * k; // 垂直方向 (-dLng, dLat)
+  const cLng = (lng0 + lng1) / 2 + dLat * k;
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const u = 1 - t;
+    pts.push([
+      u * u * lat0 + 2 * u * t * cLat + t * t * lat1,
+      u * u * lng0 + 2 * u * t * cLng + t * t * lng1,
+    ]);
+  }
+  return pts;
+}
+
+// 航向：顺时针、正北为 0（度）
+function bearing(a, b) {
+  return (Math.atan2(b[1] - a[1], b[0] - a[0]) * 180) / Math.PI;
 }
 
 // 把按时间排序的足迹，按“地区”（优先城市，否则 ~11km 网格）把连续同区合并为一“站”
@@ -681,6 +758,7 @@ function stopJourney() {
   playing.value = false;
   playCurrent.value = null;
   if (playLine) { map.removeLayer(playLine); playLine = null; }
+  if (planeMarker) { map.removeLayer(planeMarker); planeMarker = null; }
 }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -874,7 +952,16 @@ html, body, #app { height: 100%; margin: 0; }
 .tray__item--active img { border-color: #6366f1; }
 .tray__del { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; border: none; background: #ef4444; color: #fff; font-size: 12px; line-height: 1; cursor: pointer; }
 
-.photo-pin img { width: 48px; height: 48px; object-fit: cover; border-radius: 8px; border: 2px solid #fff; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5); transition: transform 0.15s ease; animation: pin-drop 0.35s ease both; }
+.photo-pin img { width: 48px; height: 48px; object-fit: cover; border-radius: 8px; border: 2px solid #fff; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4); transition: transform 0.15s ease; animation: pin-drop 0.35s ease both; }
+
+/* 点亮：深色模式下,去过的点罩上暖光 + 背后呼吸式光晕 */
+.app.theme-dark .photo-pin img { border-color: #bff0ff; box-shadow: 0 0 14px rgba(90, 200, 255, 0.85), 0 0 4px rgba(150, 225, 255, 0.9), 0 2px 8px rgba(0, 0, 0, 0.5); }
+.app.theme-dark .photo-pin__wrap::before { content: ''; position: absolute; left: 50%; top: 50%; width: 64px; height: 64px; margin: -32px 0 0 -32px; border-radius: 50%; background: radial-gradient(circle, rgba(100, 205, 255, 0.55) 0%, rgba(90, 200, 255, 0) 68%); z-index: -1; pointer-events: none; animation: pin-glow 2.6s ease-in-out infinite; }
+@keyframes pin-glow { 0%, 100% { transform: scale(0.85); opacity: 0.55; } 50% { transform: scale(1.15); opacity: 0.95; } }
+
+/* 点亮：新落点时炸开一圈暖光 */
+.lightup::before { content: ''; position: absolute; left: 0; top: 0; width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%; background: radial-gradient(circle, rgba(150, 225, 255, 0.95) 0%, rgba(90, 200, 255, 0) 70%); animation: lightup 1.1s ease-out forwards; }
+@keyframes lightup { 0% { transform: scale(0.3); opacity: 0.95; } 100% { transform: scale(7); opacity: 0; } }
 .photo-pin img:hover { transform: scale(1.18); }
 .photo-pin__wrap { position: relative; width: 48px; height: 48px; }
 .photo-pin__badge { position: absolute; top: -6px; right: -6px; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 999px; background: #6366f1; color: #fff; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4); }
@@ -883,9 +970,19 @@ html, body, #app { height: 100%; margin: 0; }
 /* 聚合气泡：照片封面 + 数字角标 */
 .cluster-pin__wrap { position: relative; width: 56px; height: 56px; }
 .cluster-pin__wrap img { width: 56px; height: 56px; object-fit: cover; border-radius: 12px; border: 2px solid #fff; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.55); }
+.app.theme-dark .cluster-pin__wrap img { border-color: #bff0ff; box-shadow: 0 0 16px rgba(90, 200, 255, 0.85), 0 0 5px rgba(150, 225, 255, 0.9), 0 2px 10px rgba(0, 0, 0, 0.55); }
+.app.theme-dark .cluster-pin__wrap::before { content: ''; position: absolute; left: 50%; top: 50%; width: 74px; height: 74px; margin: -37px 0 0 -37px; border-radius: 50%; background: radial-gradient(circle, rgba(100, 205, 255, 0.55) 0%, rgba(90, 200, 255, 0) 68%); z-index: -1; pointer-events: none; animation: pin-glow 2.6s ease-in-out infinite; }
 .cluster-pin__badge { position: absolute; top: -6px; right: -6px; min-width: 22px; height: 22px; padding: 0 6px; border-radius: 999px; background: #6366f1; color: #fff; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 5px rgba(0, 0, 0, 0.4); }
 
 @keyframes pin-drop { from { transform: translateY(-12px) scale(0.6); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* 旅程回放：飞机 + 航迹弧线 */
+.plane-fly__i { font-size: 22px; line-height: 30px; text-align: center; filter: drop-shadow(0 0 6px rgba(90, 200, 255, 0.95)); transition: transform 0.05s linear; }
+.journey-arc { filter: drop-shadow(0 0 4px rgba(90, 200, 255, 0.85)); animation: arc-flow 0.6s linear infinite; }
+@keyframes arc-flow { to { stroke-dashoffset: -10; } }
+/* 浅色模式：航线换成饱和紫罗兰，飞机加深色投影，浅底上更清爽 */
+.app.theme-light .journey-arc { stroke: #7c3aed; filter: drop-shadow(0 1px 3px rgba(124, 58, 237, 0.45)); }
+.app.theme-light .plane-fly__i { filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.4)); }
 
 /* 悬浮功能按钮 */
 .fabs { position: absolute; right: 16px; bottom: 34px; z-index: 1100; display: flex; flex-direction: column; gap: 10px; }
