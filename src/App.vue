@@ -34,9 +34,9 @@
       <div v-if="busy" class="progress">⏳ 处理中 {{ busy.done }}/{{ busy.total }}…</div>
 
       <!-- 放置模式提示 -->
-      <div v-if="placingId" class="banner">
-        📍 点击地图，放置这张照片
-        <button class="banner__cancel" @click="placingId = null">取消</button>
+      <div v-if="placingId || placingBatch" class="banner">
+        📍 {{ placingBatch ? `点击地图，一次放置这 ${selectedPending.length} 张照片` : '点击地图，放置这张照片' }}
+        <button class="banner__cancel" @click="cancelPlacing">取消</button>
       </div>
 
       <!-- 详情抽屉 -->
@@ -61,6 +61,7 @@
           <button class="chip" :class="{ 'chip--on': selectedYear == null }" @click="selectYear(null)">全部</button>
           <button v-for="y in years" :key="y" class="chip" :class="{ 'chip--on': selectedYear === y }" @click="selectYear(y)">{{ y }}</button>
         </div>
+        <button v-if="selectedYear != null" class="review__recap" @click="openRecap(selectedYear)">🎬 {{ selectedYear }} 年度回顾</button>
         <div class="trips">
           <div v-if="!trips.length" class="trips__empty">还没有足迹</div>
           <div v-for="(t, i) in trips" :key="i" class="trip" @click="zoomTo(t.photos)">
@@ -74,7 +75,7 @@
       <div class="fabs">
         <button class="fab" title="相册" @click="albumOpen = true">▦</button>
         <button class="fab" :class="{ 'fab--on': provincesOn }" title="点亮去过的城市" @click="toggleProvinces">🗺️</button>
-        <button class="fab" title="数据看板" @click="statsOpen = true">📊</button>
+        <button class="fab" title="数据看板" @click="openStats">📊</button>
         <button class="fab fab--play" title="旅程回放" @click="playJourney">▶</button>
       </div>
 
@@ -104,15 +105,49 @@
           </div>
           <div class="dash__row"><span>最常去</span><b>{{ topCity }}</b></div>
           <div class="dash__row"><span>时间跨度</span><b>{{ dateRange }}</b></div>
+          <div class="dash__ach">
+            <div class="dash__barlabel"><span>🗺️ 点亮省 / 直辖市</span><b>{{ provincesLit }} / 34</b></div>
+            <div class="dash__track"><i :style="{ width: Math.min(100, (provincesLit / 34) * 100) + '%' }"></i></div>
+            <div class="dash__badges">
+              <span v-for="b in badges" :key="b.label" class="dash__badge" :class="{ 'dash__badge--got': b.got }">{{ b.icon }} {{ b.label }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 年度回顾 -->
+      <div v-if="recapOpen && recap" class="modal" @click.self="recapOpen = false">
+        <div class="recap">
+          <button class="drawer__close" @click="recapOpen = false">✕</button>
+          <div class="recap__year">{{ recap.year }}</div>
+          <div class="recap__sub">我的年度足迹</div>
+          <div class="recap__km">{{ recap.km.toLocaleString() }}<span> km</span></div>
+          <div class="recap__grid">
+            <div><b>{{ recap.cities }}</b><span>城市</span></div>
+            <div><b>{{ recap.spots }}</b><span>足迹</span></div>
+            <div><b>{{ recap.photos }}</b><span>照片</span></div>
+          </div>
+          <div v-if="recap.topCity" class="recap__row">最常去 · <b>{{ recap.topCity }}</b></div>
+          <div v-if="recap.newCities.length" class="recap__row">这一年新点亮 · <b>{{ recap.newCities.slice(0, 6).join('、') }}</b><span v-if="recap.newCities.length > 6"> 等 {{ recap.newCities.length }} 城</span></div>
+          <div class="recap__ends">
+            <div class="recap__end"><img :src="recap.first.url" alt="" /><small>年初 · {{ fmt(recap.first.takenAt) }}</small></div>
+            <div class="recap__arrow">→</div>
+            <div class="recap__end"><img :src="recap.last.url" alt="" /><small>年末 · {{ fmt(recap.last.takenAt) }}</small></div>
+          </div>
+          <button class="btn btn--primary recap__poster" @click="posterForYear(recap.year)">🖼️ 生成 {{ recap.year }} 年度海报</button>
         </div>
       </div>
 
       <!-- 待定位照片条 -->
       <footer v-if="pending.length" class="tray">
-        <span class="tray__hint">待定位（点缩略图 → 再点地图放置）</span>
+        <div class="tray__top">
+          <span class="tray__hint">待定位（点缩略图放置 · 勾选可批量放置）</span>
+          <button v-if="selectedPending.length" class="tray__batch" @click="startBatchPlacing">📍 批量放置 {{ selectedPending.length }} 张</button>
+        </div>
         <div class="tray__list">
-          <div v-for="p in pending" :key="p.id" class="tray__item" :class="{ 'tray__item--active': placingId === p.id }">
+          <div v-for="p in pending" :key="p.id" class="tray__item" :class="{ 'tray__item--active': placingId === p.id, 'tray__item--sel': selectedPending.includes(p.id) }">
             <img :src="p.url" @click="startPlacing(p.id)" />
+            <button class="tray__pick" :class="{ 'tray__pick--on': selectedPending.includes(p.id) }" @click.stop="toggleSelect(p.id)">✓</button>
             <button class="tray__del" @click="deletePhoto(p.id)">×</button>
           </div>
         </div>
@@ -164,6 +199,8 @@ const pending = ref([]); // 待定位：{ id, takenAt, note, url }
 const selected = ref(null); // 详情抽屉中的照片
 const draftNote = ref('');
 const placingId = ref(null); // 正在放置的待定位照片 id
+const selectedPending = ref([]); // 多选待定位的 id
+const placingBatch = ref(false); // 批量放置模式
 const busy = ref(null); // 批量处理进度 { done, total }
 const cityCount = computed(() => new Set(placed.value.map((p) => p.city).filter(Boolean)).size);
 let geocoding = false;
@@ -190,6 +227,30 @@ const trips = computed(() => {
 });
 watch(selectedYear, () => renderMarkers());
 
+// 年度回顾（本地版“年度报告”）
+const recapYear = ref(null);
+const recapOpen = ref(false);
+function openRecap(y) { if (y == null) return; recapYear.value = y; recapOpen.value = true; }
+const recap = computed(() => {
+  const y = recapYear.value;
+  if (y == null) return null;
+  const list = placed.value.filter((p) => yearOf(p.takenAt) === y).sort((a, b) => ts(a.takenAt) - ts(b.takenAt));
+  if (!list.length) return null;
+  let km = 0;
+  for (let i = 1; i < list.length; i++) km += haversine(list[i - 1], list[i]);
+  const counts = {};
+  for (const p of list) if (p.city) counts[p.city] = (counts[p.city] || 0) + 1;
+  const cities = Object.keys(counts);
+  const topEntry = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  const prior = new Set(placed.value.filter((p) => yearOf(p.takenAt) < y && p.city).map((p) => p.city));
+  const newCities = cities.filter((c) => !prior.has(c));
+  const photos = allPhotos.value.filter((p) => yearOf(p.takenAt) === y).length;
+  return {
+    year: y, cities: cities.length, newCities, spots: list.length, photos, km: Math.round(km),
+    topCity: topEntry ? topEntry[0] : '', first: list[0], last: list[list.length - 1],
+  };
+});
+
 // 杀手功能：旅程回放 / 数据看板 / 点亮省份
 const playing = ref(false);
 const playCurrent = ref(null);
@@ -213,6 +274,37 @@ const dateRange = computed(() => {
   const ds = placed.value.map((p) => ts(p.takenAt)).sort((a, b) => a - b);
   return `${fmt(new Date(ds[0]))} ~ ${fmt(new Date(ds[ds.length - 1]))}`;
 });
+// 点亮成就
+const provincesLit = ref(0);
+const badges = computed(() => {
+  const c = cityCount.value, pr = provincesLit.value, km = totalKm.value, n = placed.value.length;
+  return [
+    { icon: '🏙️', label: '点亮十城', got: c >= 10 },
+    { icon: '🌏', label: '出省远行', got: pr >= 2 },
+    { icon: '🛣️', label: '千里之行', got: km >= 1000 },
+    { icon: '🧭', label: '走过半个中国', got: pr >= 17 },
+    { icon: '✈️', label: '万里之行', got: km >= 10000 },
+    { icon: '📸', label: '百处足迹', got: n >= 100 },
+  ];
+});
+// 打开数据看板：顺带用全国省界算已点亮省数（缓存 provincesGeo，离线则记 0 不阻塞）
+async function openStats() {
+  statsOpen.value = true;
+  if (!placed.value.length) { provincesLit.value = 0; return; }
+  try {
+    if (!provincesGeo) {
+      const res = await fetch('https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json');
+      provincesGeo = await res.json();
+    }
+    const set = new Set();
+    for (const f of provincesGeo.features) {
+      for (const p of placed.value) {
+        if (pointInFeature(p.lng, p.lat, f)) { set.add(f.properties.adcode); break; }
+      }
+    }
+    provincesLit.value = set.size;
+  } catch { /* 离线拿不到省界就不显示进度，不影响其它统计 */ }
+}
 let playLine = null;
 let planeMarker = null;
 let playAbort = false;
@@ -400,25 +492,54 @@ async function toDisplayable(file) {
 
 // ---- 放置待定位照片 ----
 function startPlacing(id) {
+  placingBatch.value = false;
   placingId.value = placingId.value === id ? null : id;
+}
+function toggleSelect(id) {
+  const i = selectedPending.value.indexOf(id);
+  if (i < 0) selectedPending.value.push(id);
+  else selectedPending.value.splice(i, 1);
+}
+function startBatchPlacing() {
+  if (!selectedPending.value.length) return;
+  placingId.value = null;
+  placingBatch.value = true;
+}
+function cancelPlacing() {
+  placingId.value = null;
+  placingBatch.value = false;
+}
+
+// 把一批待定位照片落到某坐标（WGS-84），入库 + 更新状态
+async function placePending(ids, wlat, wlng) {
+  for (const id of ids) {
+    const idx = pending.value.findIndex((x) => x.id === id);
+    if (idx < 0) continue;
+    const p = pending.value[idx];
+    p.lat = wlat;
+    p.lng = wlng;
+    await db.photos.update(id, { lat: wlat, lng: wlng, placed: 1 });
+    pending.value.splice(idx, 1);
+    placed.value.push(p);
+  }
+  renderMarkers();
+  pulseAt(wlat, wlng); // 点亮这个新地方
+  geocodePending();
 }
 
 async function onMapClick(e) {
+  const [wlat, wlng] = fromMap(e.latlng.lat, e.latlng.lng); // 高德点击是 GCJ-02，转回 WGS-84 存库
+  if (placingBatch.value) {
+    const ids = [...selectedPending.value];
+    placingBatch.value = false;
+    selectedPending.value = [];
+    if (ids.length) await placePending(ids, wlat, wlng);
+    return;
+  }
   if (!placingId.value) return;
   const id = placingId.value;
-  const idx = pending.value.findIndex((x) => x.id === id);
   placingId.value = null;
-  if (idx < 0) return;
-  const p = pending.value[idx];
-  const [wlat, wlng] = fromMap(e.latlng.lat, e.latlng.lng); // 高德点击是 GCJ-02，转回 WGS-84 存库
-  p.lat = wlat;
-  p.lng = wlng;
-  await db.photos.update(id, { lat: p.lat, lng: p.lng, placed: 1 });
-  pending.value.splice(idx, 1);
-  placed.value.push(p);
-  renderMarkers();
-  pulseAt(p.lat, p.lng); // 点亮这个新地方
-  geocodePending();
+  await placePending([id], wlat, wlng);
 }
 
 // ---- 备注 / 删除 ----
@@ -444,6 +565,7 @@ async function deletePhoto(id) {
   pending.value = pending.value.filter((x) => x.id !== id);
   if (selected.value?.id === id) selected.value = null;
   if (placingId.value === id) placingId.value = null;
+  selectedPending.value = selectedPending.value.filter((x) => x !== id);
   renderMarkers();
 }
 
@@ -459,6 +581,8 @@ async function clearAll() {
   pending.value = [];
   selected.value = null;
   placingId.value = null;
+  selectedPending.value = [];
+  placingBatch.value = false;
 }
 
 // 给已落点但还没城市名的照片反查城市（串行 + 节流），结果写回库。
@@ -578,10 +702,24 @@ function pulseAt(lat, lng) {
 function addGroupMarker(group) {
   const cover = group.photos[0];
   const n = group.photos.length;
-  const m = L.marker(toMap(group.lat, group.lng), { icon: spotIcon(cover.url, n), photoUrl: cover.url });
+  const m = L.marker(toMap(group.lat, group.lng), { icon: spotIcon(cover.url, n), photoUrl: cover.url, draggable: true });
   m.on('click', () => (n > 1 ? openLightbox(group.photos, 0) : openDetail(cover)));
+  m.on('dragend', () => moveGroup(group, m.getLatLng())); // 拖动微调位置
   markersLayer.addLayer(m);
   markers.set(cover.id, m);
+}
+
+// 拖动钉子后：把该点所有照片挪到新位置，清空城市待重算
+async function moveGroup(group, latlng) {
+  const [wlat, wlng] = fromMap(latlng.lat, latlng.lng);
+  for (const ph of group.photos) {
+    const rec = placed.value.find((x) => x.id === ph.id);
+    if (rec) { rec.lat = wlat; rec.lng = wlng; rec.city = ''; }
+    await db.photos.update(ph.id, { lat: wlat, lng: wlng, city: '' });
+  }
+  renderMarkers(false); // 微调不重定位镜头
+  pulseAt(wlat, wlng);
+  geocodePending(); // 重新反查城市
 }
 
 function spotIcon(url, n) {
@@ -605,11 +743,11 @@ function yearOf(d) { return (d instanceof Date ? d : new Date(d)).getFullYear();
 function ts(d) { return (d instanceof Date ? d : new Date(d)).getTime(); }
 
 // 按当前年份筛选重绘钉子
-function renderMarkers() {
+function renderMarkers(refit = true) {
   markersLayer.clearLayers();
   markers.clear();
   for (const g of groupBySpot(visiblePlaced.value)) addGroupMarker(g);
-  fitToPhotos();
+  if (refit) fitToPhotos();
 }
 
 function selectYear(y) { selectedYear.value = y; }
@@ -620,24 +758,29 @@ function zoomTo(photos) {
   reviewOpen.value = false;
 }
 
+async function exportPoster(list0, photoCount, yearFrom, yearTo) {
+  const list = [...list0].sort((a, b) => ts(a.takenAt) - ts(b.takenAt));
+  const route = buildStops(list).map((s) => ({ lat: s.lat, lng: s.lng })); // 按时间的行程站点
+  const cities = [...new Set(list.map((p) => p.city).filter(Boolean))];
+  const blob = await drawPoster(
+    { cities: cities.length, spots: list.length, photos: photoCount, yearFrom, yearTo, topCities: cities.slice(0, 8) },
+    route,
+  );
+  download(blob, `life-map-海报-${stamp()}.png`);
+}
 async function onPoster() {
   try {
-    const list = [...placed.value].sort((a, b) => ts(a.takenAt) - ts(b.takenAt));
-    const route = buildStops(list).map((s) => ({ lat: s.lat, lng: s.lng })); // 按时间的行程站点
-    const cities = [...new Set(placed.value.map((p) => p.city).filter(Boolean))];
     const ys = years.value;
-    const blob = await drawPoster(
-      {
-        cities: cities.length,
-        spots: placed.value.length,
-        photos: placed.value.length + pending.value.length,
-        yearFrom: ys.length ? ys[ys.length - 1] : null,
-        yearTo: ys.length ? ys[0] : null,
-        topCities: cities.slice(0, 8),
-      },
-      route,
-    );
-    download(blob, `life-map-海报-${stamp()}.png`);
+    await exportPoster(placed.value, placed.value.length + pending.value.length, ys.length ? ys[ys.length - 1] : null, ys.length ? ys[0] : null);
+  } catch (e) {
+    alert('生成海报失败：' + (e?.message || e));
+  }
+}
+async function posterForYear(y) {
+  try {
+    const inYear = placed.value.filter((p) => yearOf(p.takenAt) === y);
+    const photos = allPhotos.value.filter((p) => yearOf(p.takenAt) === y).length;
+    await exportPoster(inYear, photos, y, y);
   } catch (e) {
     alert('生成海报失败：' + (e?.message || e));
   }
@@ -962,12 +1105,18 @@ html, body, #app { height: 100%; margin: 0; }
 .trip__meta { font-size: 12px; color: #777; margin-top: 4px; }
 
 .tray { position: absolute; left: 0; right: 0; bottom: 0; z-index: 1100; background: rgba(255, 255, 255, 0.7); backdrop-filter: blur(14px) saturate(1.3); -webkit-backdrop-filter: blur(14px) saturate(1.3); border-top: 1px solid rgba(255, 255, 255, 0.5); padding: 8px 12px; }
+.tray__top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .tray__hint { font-size: 12px; color: #888; }
+.tray__batch { flex-shrink: 0; border: none; border-radius: 999px; padding: 6px 12px; background: #6366f1; color: #fff; font-size: 12px; font-weight: 700; cursor: pointer; box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4); }
+.tray__batch:hover { filter: brightness(1.05); }
 .tray__list { display: flex; gap: 8px; overflow-x: auto; padding-top: 6px; }
 .tray__item { position: relative; flex-shrink: 0; }
 .tray__item img { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; border: 2px solid transparent; cursor: pointer; }
 .tray__item--active img { border-color: #6366f1; }
+.tray__item--sel img { border-color: #5ac8ff; box-shadow: 0 0 8px rgba(90, 200, 255, 0.7); }
 .tray__del { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; border: none; background: #ef4444; color: #fff; font-size: 12px; line-height: 1; cursor: pointer; }
+.tray__pick { position: absolute; top: -6px; left: -6px; width: 18px; height: 18px; border-radius: 50%; border: none; background: rgba(0, 0, 0, 0.35); color: #fff; font-size: 11px; line-height: 1; cursor: pointer; }
+.tray__pick--on { background: #5ac8ff; box-shadow: 0 0 6px rgba(90, 200, 255, 0.8); }
 
 .photo-pin img { width: 48px; height: 48px; object-fit: cover; border-radius: 8px; border: 2px solid #fff; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4); transition: transform 0.15s ease; animation: pin-drop 0.35s ease both; }
 
@@ -1030,6 +1179,38 @@ html, body, #app { height: 100%; margin: 0; }
 .dash__row { display: flex; justify-content: space-between; font-size: 14px; padding: 8px 2px; border-top: 1px solid #eee; }
 .dash__row span { color: #888; }
 .dash__row b { color: #333; }
+/* 点亮成就 */
+.dash__ach { margin-top: 16px; padding-top: 14px; border-top: 1px solid #eee; }
+.dash__barlabel { display: flex; justify-content: space-between; font-size: 13px; color: #666; margin-bottom: 6px; }
+.dash__barlabel b { color: #0a84c2; font-weight: 800; }
+.dash__track { height: 9px; border-radius: 999px; background: rgba(90, 200, 255, 0.15); overflow: hidden; }
+.dash__track i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, #5ac8ff, #38bdf8); box-shadow: 0 0 8px rgba(90, 200, 255, 0.7); transition: width 0.6s ease; }
+.dash__badges { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+.dash__badge { font-size: 12px; padding: 5px 9px; border-radius: 999px; background: rgba(0, 0, 0, 0.05); color: #aaa; filter: grayscale(1); opacity: 0.55; }
+.dash__badge--got { background: rgba(90, 200, 255, 0.14); color: #0a84c2; font-weight: 700; filter: none; opacity: 1; box-shadow: 0 0 10px rgba(90, 200, 255, 0.45); }
+
+/* 年度回顾入口按钮 */
+.review__recap { width: 100%; margin: 4px 0 12px; padding: 10px; border: none; border-radius: 12px; background: linear-gradient(135deg, #6366f1, #a855f7); color: #fff; font-size: 14px; font-weight: 700; cursor: pointer; box-shadow: 0 4px 14px rgba(139, 92, 246, 0.4); }
+.review__recap:hover { filter: brightness(1.05); }
+/* 年度回顾卡片 */
+.recap { position: relative; width: 360px; max-width: 90vw; padding: 30px 26px 26px; border-radius: 22px; text-align: center; color: #fff; background: linear-gradient(160deg, #6366f1 0%, #8b5cf6 55%, #a855f7 100%); box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45); }
+.recap .drawer__close { color: rgba(255, 255, 255, 0.9); }
+.recap__year { font-size: 64px; font-weight: 900; line-height: 1; letter-spacing: 1px; }
+.recap__sub { margin-top: 4px; font-size: 15px; opacity: 0.9; }
+.recap__km { margin-top: 20px; font-size: 46px; font-weight: 900; }
+.recap__km span { font-size: 20px; opacity: 0.85; }
+.recap__grid { display: flex; gap: 10px; margin: 18px 0 6px; }
+.recap__grid > div { flex: 1; background: rgba(255, 255, 255, 0.15); border-radius: 14px; padding: 12px 0; }
+.recap__grid b { display: block; font-size: 26px; font-weight: 800; }
+.recap__grid span { font-size: 12px; opacity: 0.85; }
+.recap__row { margin-top: 12px; font-size: 14px; opacity: 0.95; }
+.recap__row b { font-weight: 800; }
+.recap__ends { display: flex; align-items: center; justify-content: center; gap: 12px; margin: 20px 0 6px; }
+.recap__end { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.recap__end img { width: 76px; height: 76px; object-fit: cover; border-radius: 12px; border: 2px solid rgba(255, 255, 255, 0.85); }
+.recap__end small { font-size: 11px; opacity: 0.9; }
+.recap__arrow { font-size: 22px; opacity: 0.8; }
+.recap__poster { margin-top: 18px; width: 100%; background: rgba(255, 255, 255, 0.95); color: #6d28d9; font-weight: 800; }
 
 /* 搜索框 */
 .search { width: 150px; border: none; border-radius: 999px; padding: 6px 12px; font-size: 13px; background: rgba(255, 255, 255, 0.9); outline: none; }
