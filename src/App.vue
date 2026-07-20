@@ -1,5 +1,5 @@
 <template>
-  <div class="app" :class="'theme-' + theme">
+  <div class="app" :class="['theme-' + theme, 'lang-' + lang]">
     <header class="topbar">
       <span class="topbar__title">🗺️ 我的人生地图</span>
       <div class="topbar__right">
@@ -946,6 +946,9 @@ html, body, #app { height: 100%; margin: 0; }
 
 /* 浅色主题：底图变亮时，面板略加不透明度以保证对比 */
 .app.theme-light .drawer, .app.theme-light .review, .app.theme-light .tray { background: rgba(255, 255, 255, 0.86); }
+
+/* 高德深色版：中文底图 + 深色主题时，CSS 反相把浅色高德做成暗色地图 */
+.app.lang-zh.theme-dark .leaflet-tile-pane { filter: invert(0.92) hue-rotate(180deg) brightness(0.9) contrast(0.9) saturate(0.9); }
 
 /* 空状态引导 */
 .empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 500; text-align: center; pointer-events: none; background: rgba(0, 0, 0, 0.42); backdrop-filter: blur(6px); color: #fff; padding: 28px 36px; border-radius: 20px; }
