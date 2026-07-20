@@ -73,7 +73,7 @@
       <!-- 悬浮功能按钮 -->
       <div class="fabs">
         <button class="fab" title="相册" @click="albumOpen = true">▦</button>
-        <button class="fab" :class="{ 'fab--on': provincesOn }" title="点亮省份" @click="toggleProvinces">🗺️</button>
+        <button class="fab" :class="{ 'fab--on': provincesOn }" title="点亮去过的城市" @click="toggleProvinces">🗺️</button>
         <button class="fab" title="数据看板" @click="statsOpen = true">📊</button>
         <button class="fab fab--play" title="旅程回放" @click="playJourney">▶</button>
       </div>
@@ -218,6 +218,7 @@ let planeMarker = null;
 let playAbort = false;
 let provinceLayer = null;
 let provincesGeo = null;
+let cityGeoByProv = {}; // 省 adcode → 该省城市边界 GeoJSON（按需缓存）
 
 // 锦上：lightbox / 相册 / 搜索 / 去年今日
 const lightbox = ref(null); // { list, index }
@@ -772,7 +773,7 @@ function haversine(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-// ---- 7. 点亮去过的省份 ----
+// ---- 7. 点亮去过的城市（地级市）----
 async function toggleProvinces() {
   if (provinceLayer) {
     map.removeLayer(provinceLayer);
@@ -780,27 +781,43 @@ async function toggleProvinces() {
     provincesOn.value = false;
     return;
   }
+  if (!placed.value.length) { alert('还没有已定位的足迹，先放几张照片再点亮～'); return; }
   provincesOn.value = true;
   try {
+    // 1) 用全国省界找出有足迹的省
     if (!provincesGeo) {
       const res = await fetch('https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json');
       provincesGeo = await res.json();
     }
-    const visited = new Set();
+    const provAdcodes = new Set();
     for (const f of provincesGeo.features) {
+      for (const p of placed.value) {
+        if (pointInFeature(p.lng, p.lat, f)) { provAdcodes.add(f.properties.adcode); break; }
+      }
+    }
+    // 2) 按需下载这些省的城市边界（直辖市会下到区级，正好也算“地方”）
+    const cityFeatures = [];
+    await Promise.all([...provAdcodes].map(async (code) => {
+      if (!cityGeoByProv[code]) {
+        const r = await fetch(`https://geo.datav.aliyun.com/areas_v3/bound/${code}_full.json`);
+        cityGeoByProv[code] = await r.json();
+      }
+      cityFeatures.push(...cityGeoByProv[code].features);
+    }));
+    // 3) 点在城市多边形内才算去过 → 只染去过的市
+    const visited = new Set();
+    for (const f of cityFeatures) {
       for (const p of placed.value) {
         if (pointInFeature(p.lng, p.lat, f)) { visited.add(f.properties.adcode); break; }
       }
     }
-    provinceLayer = L.geoJSON(provincesGeo, {
-      style: (f) =>
-        visited.has(f.properties.adcode)
-          ? { color: '#a855f7', weight: 1, fillColor: '#a855f7', fillOpacity: 0.35 }
-          : { color: '#999', weight: 0.5, fillColor: '#000', fillOpacity: 0.04 },
+    const visitedGeo = { type: 'FeatureCollection', features: cityFeatures.filter((f) => visited.has(f.properties.adcode)) };
+    provinceLayer = L.geoJSON(visitedGeo, {
+      style: () => ({ color: '#5ac8ff', weight: 1.5, fillColor: '#5ac8ff', fillOpacity: 0.3 }),
     }).addTo(map);
   } catch (e) {
     provincesOn.value = false;
-    alert('加载省界失败：' + (e?.message || e));
+    alert('加载城市边界失败：' + (e?.message || e));
   }
 }
 
